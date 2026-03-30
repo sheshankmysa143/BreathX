@@ -7,7 +7,9 @@ Handles HTTP requests, database operations, and communicates with Haskell micros
 import os
 import csv
 import json
-import sqlite3
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool
 from datetime import datetime, timedelta
 from functools import wraps
 
@@ -30,7 +32,15 @@ executor = ThreadPoolExecutor(max_workers=5)
 # =============================================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE_PATH = os.path.join(BASE_DIR, 'database', 'breathx.db')
+DATABASE_URL = os.getenv('DATABASE_URL')
+# Use a connection pool for production efficiency
+db_pool = None
+if DATABASE_URL:
+    try:
+        db_pool = pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
+        print("PostgreSQL connection pool initialized.")
+    except Exception as e:
+        print(f"Error creating PostgreSQL connection pool: {e}")
 HASKELL_SERVICE_URL = os.getenv('HASKELL_SERVICE_URL', 'http://localhost:8080')
 
 # External API Keys (Loaded from .env)
@@ -43,112 +53,115 @@ OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 # =============================================================================
 
 def get_db():
-    """Get database connection for current request context."""
+    """Get database connection from the pool for current request context."""
     if 'db' not in g:
-        g.db = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        g.db.row_factory = sqlite3.Row
+        if db_pool:
+            g.db = db_pool.getconn()
+        else:
+            # Fallback if pool is not initialized (e.g. local dev without URL)
+            raise ConnectionError("Database connection pool not initialized (check DATABASE_URL)")
     return g.db
 
 
 def query_db(query: str, args: tuple = (), one: bool = False):
     """
-    Production-level reusable database query helper.
-
-    Args:
-        query: SQL query string with ? placeholders
-        args: Tuple of arguments for the query
-        one: If True, returns a single row (fetchone); otherwise returns all (fetchall)
-
-    Returns:
-        sqlite3.Row (single) or list of sqlite3.Row objects, or None if no results
-
-    Usage:
-        # Fetch one row
-        user = query_db("SELECT * FROM users WHERE id = ?", (user_id,), one=True)
-
-        # Fetch all rows
-        users = query_db("SELECT * FROM users WHERE active = ?", (1,))
-
-        # Insert/Update (returns affected row count)
-        db.execute("INSERT INTO logs (msg) VALUES (?)", (msg,))
-        db.commit()
+    Production-level reusable PostgreSQL database query helper.
     """
     db = get_db()
-    cursor = db.execute(query, args)
-
-    if one:
-        result = cursor.fetchone()
-    else:
-        result = cursor.fetchall()
-
-    # Row objects are already detached from the cursor after fetch.
-    # Keep connection open for Flask's request lifecycle.
-    return result
+    cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    
+    try:
+        cursor.execute(query, args)
+        if query.strip().upper().startswith("SELECT"):
+            if one:
+                result = cursor.fetchone()
+            else:
+                result = cursor.fetchall()
+        else:
+            db.commit()
+            result = cursor.rowcount
+        return result
+    except Exception as e:
+        db.rollback()
+        print(f"Database query error: {e}")
+        return None
+    finally:
+        cursor.close()
 
 
 @app.teardown_appcontext
 def close_db(exception):
-    """Close database connection at end of request."""
+    """Return database connection to the pool at end of request."""
     db = g.pop('db', None)
-    if db is not None:
-        db.close()
+    if db is not None and db_pool is not None:
+        db_pool.putconn(db)
 
 
 def init_database():
     """Initialize database with schema and sample data if empty."""
-    schema_path = os.path.join(BASE_DIR, 'database', 'schema.sql')
+    if not DATABASE_URL:
+        print("DATABASE_URL not set. Skipping initialization.")
+        return
+
+    schema_path = os.path.join(BASE_DIR, 'database', 'schema_pg.sql')
     csv_path = os.path.join(BASE_DIR, 'database', 'sample_aqi_data.csv')
 
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.execute("PRAGMA foreign_keys = OFF")
-    cursor = conn.cursor()
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cursor = conn.cursor()
 
-    # Read and execute schema
-    with open(schema_path, 'r') as f:
-        cursor.executescript(f.read())
+        # Read and execute schema
+        with open(schema_path, 'r') as f:
+            cursor.execute(f.read())
 
-    # Check if data exists
-    cursor.execute("SELECT COUNT(*) FROM aqi_records")
-    if cursor.fetchone()[0] == 0:
-        # Insert city info first (required for foreign key)
-        cities = [
-            ('Delhi', 'India', 28.6139, 77.2090, 32941000),
-            ('Mumbai', 'India', 19.0760, 72.8777, 20667656),
-            ('Bangalore', 'India', 12.9716, 77.5946, 12765000),
-            ('Chennai', 'India', 13.0827, 80.2707, 11235000),
-            ('Kolkata', 'India', 22.5726, 88.3639, 14850000),
-            ('Hyderabad', 'India', 17.3850, 78.4867, 10534000),
-            ('Pune', 'India', 18.5204, 73.8567, 7230000),
-            ('Jaipur', 'India', 26.9124, 75.7873, 4185000),
-            ('Lucknow', 'India', 26.8467, 80.9462, 3382000),
-            ('Ahmedabad', 'India', 23.0225, 72.5714, 5617000),
-        ]
-        for city in cities:
-            cursor.execute("""
-                INSERT OR IGNORE INTO city_info (city_name, country, latitude, longitude, population)
-                VALUES (?, ?, ?, ?, ?)
-            """, city)
-
-        # Load sample CSV data
-        with open(csv_path, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+        # Check if data exists
+        cursor.execute("SELECT COUNT(*) FROM aqi_records")
+        if cursor.fetchone()[0] == 0:
+            # Insert city info first (required for foreign key)
+            cities = [
+                ('Delhi', 'India', 28.6139, 77.2090, 32941000),
+                ('Mumbai', 'India', 19.0760, 72.8777, 20667656),
+                ('Bangalore', 'India', 12.9716, 77.5946, 12765000),
+                ('Chennai', 'India', 13.0827, 80.2707, 11235000),
+                ('Kolkata', 'India', 22.5726, 88.3639, 14850000),
+                ('Hyderabad', 'India', 17.3850, 78.4867, 10534000),
+                ('Pune', 'India', 18.5204, 73.8567, 7230000),
+                ('Jaipur', 'India', 26.9124, 75.7873, 4185000),
+                ('Lucknow', 'India', 26.8467, 80.9462, 3382000),
+                ('Ahmedabad', 'India', 23.0225, 72.5714, 5617000),
+            ]
+            for city in cities:
                 cursor.execute("""
-                    INSERT OR IGNORE INTO aqi_records
-                    (city_name, date, aqi, pm25, pm10, no2, so2, co, o3, category, pollutant, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    row['city_name'], row['date'], float(row['aqi']),
-                    float(row.get('pm25', 0) or 0), float(row.get('pm10', 0) or 0),
-                    float(row.get('no2', 0) or 0), float(row.get('so2', 0) or 0),
-                    float(row.get('co', 0) or 0), float(row.get('o3', 0) or 0),
-                    row.get('category', ''), row.get('pollutant', ''), row.get('source', 'CPCB')
-                ))
+                    INSERT INTO city_info (city_name, country, latitude, longitude, population)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (city_name) DO NOTHING
+                """, city)
 
-        conn.commit()
-        print("Database initialized with sample data.")
+            # Load sample CSV data
+            if os.path.exists(csv_path):
+                with open(csv_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        cursor.execute("""
+                            INSERT INTO aqi_records
+                            (city_name, date, aqi, pm25, pm10, no2, so2, co, o3, category, pollutant, source)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (city_name, date) DO NOTHING
+                        """, (
+                            row['city_name'], row['date'], float(row['aqi']),
+                            float(row.get('pm25', 0) or 0), float(row.get('pm10', 0) or 0),
+                            float(row.get('no2', 0) or 0), float(row.get('so2', 0) or 0),
+                            float(row.get('co', 0) or 0), float(row.get('o3', 0) or 0),
+                            row.get('category', ''), row.get('pollutant', ''), row.get('source', 'CPCB')
+                        ))
 
-    conn.close()
+            conn.commit()
+            print("Database initialized with sample data.")
+
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error initializing database: {e}")
 
 
 def sync_historical_data(city_name):
@@ -158,7 +171,7 @@ def sync_historical_data(city_name):
     
     db = get_db()
     # 0. Get city coordinates for precision lookup
-    city = db.execute("SELECT latitude, longitude FROM city_info WHERE city_name = ?", (city_name,)).fetchone()
+    city = query_db("SELECT latitude, longitude FROM city_info WHERE city_name = %s", (city_name,), one=True)
     lat = city['latitude'] if city else None
     lon = city['longitude'] if city else None
 
@@ -167,22 +180,26 @@ def sync_historical_data(city_name):
     if not historical_data:
         return False
         
-    db = get_db()
     for record in historical_data:
         try:
             # Replace if it exists or insert new
-            db.execute("""
-                INSERT OR REPLACE INTO aqi_records (
+            query_db("""
+                INSERT INTO aqi_records (
                     city_name, date, aqi, pm25, pm10, category, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (city_name, date) DO UPDATE SET
+                    aqi = EXCLUDED.aqi,
+                    pm25 = EXCLUDED.pm25,
+                    pm10 = EXCLUDED.pm10,
+                    category = EXCLUDED.category,
+                    source = EXCLUDED.source
             """, (
                 city_name, record['date'], record['aqi'], record['pm25'], 
                 record['pm25']*1.2, record['category'], record['source']
             ))
-        except sqlite3.Error as e:
+        except Exception as e:
             print(f"Error backfilling Mar 15-28 for {city_name} on {record['date']}: {e}")
             
-    db.commit()
     return True
 
 
@@ -196,29 +213,36 @@ def get_realtime_aqi(city_name):
         
     db = get_db()
     # 2. Check if we need to update the database cache (60 minutes)
-    recent = db.execute("""
+    recent = query_db("""
         SELECT created_at FROM aqi_records 
-        WHERE city_name = ? AND created_at >= datetime('now', '-60 minutes')
+        WHERE city_name = %s AND created_at >= NOW() - INTERVAL '60 minutes'
         AND source != 'Central Pollution Control Board'
         ORDER BY created_at DESC LIMIT 1
-    """, (city_name,)).fetchone()
+    """, (city_name,), one=True)
 
     # 3. Only save to DB if cache is stale
     if not recent:
         try:
-            db.execute("""
-                INSERT OR REPLACE INTO aqi_records (
+            query_db("""
+                INSERT INTO aqi_records (
                     city_name, date, aqi, pm25, pm10, no2, category, pollutant, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (city_name, date) DO UPDATE SET
+                    aqi = EXCLUDED.aqi,
+                    pm25 = EXCLUDED.pm25,
+                    pm10 = EXCLUDED.pm10,
+                    no2 = EXCLUDED.no2,
+                    category = EXCLUDED.category,
+                    pollutant = EXCLUDED.pollutant,
+                    source = EXCLUDED.source
             """, (
                 city_name, data['date'], data['aqi'], data['pm25'], data['pm10'],
                 data['no2'], classify_aqi(data['aqi']), data['pollutant'], data['source']
             ))
-            db.commit()
             
             # Trigger Backfill for Mar 15-28 gap
             sync_historical_data(city_name)
-        except sqlite3.Error as e:
+        except Exception as e:
             print(f"Database error while saving real-time data: {e}")
 
     # 4. ALWAYS return data so the API can serve the forecast
@@ -364,34 +388,33 @@ def home():
     """Home page with overview and quick stats."""
     db = get_db()
 
-    # Get overall stats - use cursor properly by chaining fetchone() on execute() result
-    cursor = db.execute("""
+    # Get overall stats
+    overall = query_db("""
         SELECT COUNT(DISTINCT city_name) as city_count,
                AVG(aqi) as avg_aqi,
                MAX(aqi) as max_aqi
         FROM aqi_records
-        WHERE date >= date('now', '-30 days')
-    """)
-    overall = cursor.fetchone()
+        WHERE date >= CURRENT_DATE - INTERVAL '30 days'
+    """, one=True)
 
     # Get recent alerts
-    alerts = db.execute("""
+    alerts = query_db("""
         SELECT city_name, aqi, date, category
         FROM aqi_records
-        WHERE aqi > 200 AND date >= date('now', '-7 days')
+        WHERE aqi > 200 AND date >= CURRENT_DATE - INTERVAL '7 days'
         ORDER BY aqi DESC LIMIT 5
-    """).fetchall()
+    """)
 
     # Get top polluted cities today
-    top_cities = db.execute("""
+    top_cities = query_db("""
         SELECT city_name, aqi, category, date, pollutant
         FROM aqi_records
         WHERE date = (SELECT MAX(date) FROM aqi_records)
         ORDER BY aqi DESC LIMIT 5
-    """).fetchall()
+    """)
 
     # Get all cities for the map
-    all_cities = db.execute("""
+    all_cities = query_db("""
         SELECT r.city_name, r.aqi, r.category, r.date, r.pollutant,
                c.latitude, c.longitude
         FROM aqi_records r
@@ -399,7 +422,7 @@ def home():
         WHERE r.record_id IN (
             SELECT MAX(record_id) FROM aqi_records GROUP BY city_name
         )
-    """).fetchall()
+    """)
 
     # Convert to list of dicts for JSON serialization
     map_data = [
@@ -425,14 +448,14 @@ def dashboard():
     db = get_db()
 
     # Get all cities with latest AQI
-    cities = db.execute("""
+    cities = query_db("""
         SELECT r.city_name, r.aqi, r.category, r.date, r.pollutant,
                c.latitude, c.longitude
         FROM aqi_records r
         LEFT JOIN city_info c ON r.city_name = c.city_name
         WHERE r.date = (SELECT MAX(date) FROM aqi_records WHERE city_name = r.city_name)
         ORDER BY r.aqi DESC
-    """).fetchall()
+    """)
 
     return render_template('dashboard.html', cities=cities)
 
@@ -451,12 +474,12 @@ def city_details(city_name):
         return render_template('404.html', message=f"City '{city_name}' not found"), 404
 
     # Get recent records for the city
-    records = db.execute("""
+    records = query_db("""
         SELECT * FROM aqi_records
-        WHERE city_name = ?
+        WHERE city_name = %s
         ORDER BY date DESC
         LIMIT 30
-    """, (city_name,)).fetchall()
+    """, (city_name,))
 
     return render_template('city_details.html', city=city_info, records=records)
 
@@ -467,7 +490,8 @@ def compare_cities():
     db = get_db()
 
     # Get all cities for dropdown
-    cities = db.execute("SELECT city_name FROM city_info ORDER BY city_name").fetchall()
+    # Get all cities for dropdown
+    cities = query_db("SELECT city_name FROM city_info ORDER BY city_name")
 
     # Get selected cities if provided
     city1 = request.args.get('city1', 'Delhi')
@@ -482,12 +506,12 @@ def alerts_page():
     db = get_db()
 
     # Get all active alerts
-    active_alerts = db.execute("""
+    active_alerts = query_db("""
         SELECT city_name, date, aqi, category, pollutant
         FROM aqi_records
         WHERE aqi > 200
         ORDER BY aqi DESC
-    """).fetchall()
+    """)
 
     return render_template('alerts.html', alerts=active_alerts)
 
@@ -506,11 +530,11 @@ def recommendations_page(city_name):
         return render_template('404.html', message=f"City '{city_name}' not found"), 404
 
     # Get recent AQI data for analysis
-    records = db.execute("""
+    records = query_db("""
         SELECT date, aqi, category FROM aqi_records
-        WHERE city_name = ? AND date >= date('now', '-30 days')
+        WHERE city_name = %s AND date >= CURRENT_DATE - INTERVAL '30 days'
         ORDER BY date DESC
-    """, (city_name,)).fetchall()
+    """, (city_name,))
 
     return render_template('recommendations.html', city=city_info, records=records)
 
@@ -541,12 +565,12 @@ def report_analytical(city_name):
     if not city_info:
         return render_template('404.html', message=f"City '{city_name}' not found"), 404
 
-    records = db.execute("""
+    records = query_db("""
         SELECT * FROM aqi_records
-        WHERE city_name = ?
+        WHERE city_name = %s
         ORDER BY date DESC
         LIMIT 30
-    """, (city_name,)).fetchall()
+    """, (city_name,))
 
     return render_template('reports.html', city=city_info, records=records)
 
@@ -568,14 +592,14 @@ def api_cities():
     """Get list of all cities with latest AQI."""
     db = get_db()
 
-    cities = db.execute("""
+    cities = query_db("""
         SELECT r.city_name, r.aqi, r.category, r.date, r.pollutant,
                c.latitude, c.longitude, c.population
         FROM aqi_records r
         LEFT JOIN city_info c ON r.city_name = c.city_name
         WHERE r.date = (SELECT MAX(date) FROM aqi_records WHERE city_name = r.city_name)
         ORDER BY r.aqi DESC
-    """).fetchall()
+    """)
 
     return jsonify([{
         'city': row['city_name'],
@@ -600,11 +624,11 @@ def api_aqi(city_name):
     days = request.args.get('days', 30, type=int)
     
     # 2. Check local report cache (30-minute cache for history)
-    cached_report = db.execute("""
+    cached_report = query_db("""
         SELECT report_data FROM cached_reports
-        WHERE city_name = ? AND report_type = 'analysis' 
-        AND generated_at >= datetime('now', '-30 minutes')
-    """, (city_name,)).fetchone()
+        WHERE city_name = %s AND report_type = 'analysis' 
+        AND generated_at >= NOW() - INTERVAL '30 minutes'
+    """, (city_name,), one=True)
 
     if cached_report:
         report_data = json.loads(cached_report['report_data'])
@@ -616,12 +640,12 @@ def api_aqi(city_name):
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-    records_rows = db.execute("""
+    records_rows = query_db("""
         SELECT date, aqi, pm25, pm10, no2, so2, co, o3, category, pollutant
         FROM aqi_records
-        WHERE city_name = ? AND date >= ? AND date <= ?
+        WHERE city_name = %s AND date >= %s AND date <= %s
         ORDER BY date DESC
-    """, (city_name, start_date, end_date)).fetchall()
+    """, (city_name, start_date, end_date))
 
     if not records_rows:
         return jsonify({'error': f'No data found for {city_name}'}), 404
@@ -678,11 +702,13 @@ def api_aqi(city_name):
     }
 
     # 3. Cache the analysis result
-    db.execute("""
-        INSERT OR REPLACE INTO cached_reports (city_name, report_type, report_data, generated_at)
-        VALUES (?, 'analysis', ?, datetime('now'))
+    query_db("""
+        INSERT INTO cached_reports (city_name, report_type, report_data, generated_at)
+        VALUES (%s, 'analysis', %s, NOW())
+        ON CONFLICT (city_name, report_type) DO UPDATE SET
+            report_data = EXCLUDED.report_data,
+            generated_at = EXCLUDED.generated_at
     """, (city_name, json.dumps(response_data)))
-    db.commit()
 
     return jsonify(response_data)
 
@@ -703,17 +729,17 @@ def api_compare():
     end_date = datetime.now().strftime('%Y-%m-%d')
     start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
 
-    records1 = db.execute("""
+    records1 = query_db("""
         SELECT date, aqi FROM aqi_records
-        WHERE city_name = ? AND date >= ? AND date <= ?
+        WHERE city_name = %s AND date >= %s AND date <= %s
         ORDER BY date DESC
-    """, (city1, start_date, end_date)).fetchall()
+    """, (city1, start_date, end_date))
 
-    records2 = db.execute("""
+    records2 = query_db("""
         SELECT date, aqi FROM aqi_records
-        WHERE city_name = ? AND date >= ? AND date <= ?
+        WHERE city_name = %s AND date >= %s AND date <= %s
         ORDER BY date DESC
-    """, (city2, start_date, end_date)).fetchall()
+    """, (city2, start_date, end_date))
 
     if not records1 or not records2:
         return jsonify({'error': 'Insufficient data for comparison'}), 404
@@ -752,23 +778,23 @@ def api_alerts():
     db = get_db()
     
     # 1. Check Cache First (Fresh alerts from last 15 minutes)
-    cached = db.execute("""
+    cached = query_db("""
         SELECT city_name as city, message as alert, severity, aqi_value as max_aqi
         FROM alerts_cache
-        WHERE is_active = 1 AND created_at >= datetime('now', '-15 minutes')
-    """).fetchall()
+        WHERE is_active = 1 AND created_at >= NOW() - INTERVAL '15 minutes'
+    """)
     
     if cached:
         return jsonify({'alerts': [dict(row) for row in cached]})
 
     # 2. If no cache, generate new alerts
     # Get all records with AQI > 200 from the last 24 hours
-    alerts = db.execute("""
+    alerts = query_db("""
         SELECT city_name, date, aqi, category, pollutant
         FROM aqi_records
-        WHERE aqi > 200 AND date >= date('now', '-24 hours')
+        WHERE aqi > 200 AND date >= CURRENT_DATE - INTERVAL '1 day'
         ORDER BY aqi DESC
-    """).fetchall()
+    """)
 
     # Prepare payload for Haskell alert generation
     records_by_city = {}
@@ -807,17 +833,16 @@ def api_alerts():
     if generated_alerts:
         try:
             # Mark old alerts as inactive
-            db.execute("UPDATE alerts_cache SET is_active = 0")
+            query_db("UPDATE alerts_cache SET is_active = 0")
             
             for alert in generated_alerts:
-                db.execute("""
+                query_db("""
                     INSERT INTO alerts_cache (city_name, alert_type, severity, message, aqi_value, date)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (%s, 'AQI', %s, %s, %s, %s)
                 """, (
-                    alert['city'], 'AQI', alert['severity'], alert['alert'], 
+                    alert['city'], alert['severity'], alert['alert'], 
                     alert['max_aqi'], datetime.now().strftime('%Y-%m-%d')
                 ))
-            db.commit()
         except Exception as e:
             print(f"Cache storage error: {e}")
 
@@ -830,30 +855,30 @@ def api_report(city_name):
     db = get_db()
     
     # 1. Check Full Report Cache First (30-minute cache)
-    cached_report = db.execute("""
+    cached_report = query_db("""
         SELECT report_data FROM cached_reports
-        WHERE city_name = ? AND report_type = 'full' 
-        AND generated_at >= datetime('now', '-30 minutes')
-    """, (city_name,)).fetchone()
+        WHERE city_name = %s AND report_type = 'full' 
+        AND generated_at >= NOW() - INTERVAL '30 minutes'
+    """, (city_name,), one=True)
 
     if cached_report:
         print(f"Using cached full report for {city_name}")
         return jsonify(json.loads(cached_report['report_data']))
 
     # 2. If no cache, fetch data (up to last 90 days)
-    city_info = db.execute(
-        "SELECT * FROM city_info WHERE city_name = ?", (city_name,)
-    ).fetchone()
+    city_info = query_db(
+        "SELECT * FROM city_info WHERE city_name = %s", (city_name,), one=True
+    )
 
     if not city_info:
         return jsonify({'error': f'City {city_name} not found'}), 404
 
-    records = db.execute("""
+    records = query_db("""
         SELECT date, aqi, pm25, pm10, no2, so2, co, o3, category, pollutant
         FROM aqi_records
-        WHERE city_name = ? AND date >= date('now', '-90 days')
+        WHERE city_name = %s AND date >= CURRENT_DATE - INTERVAL '90 days'
         ORDER BY date DESC
-    """, (city_name,)).fetchall()
+    """, (city_name,))
 
     if not records:
         return jsonify({'error': f'No historical data found for {city_name}'}), 404
@@ -884,11 +909,13 @@ def api_report(city_name):
 
     # 3. Cache the full report result
     try:
-        db.execute("""
-            INSERT OR REPLACE INTO cached_reports (city_name, report_type, report_data)
-            VALUES (?, ?, ?)
+        query_db("""
+            INSERT INTO cached_reports (city_name, report_type, report_data)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (city_name, report_type) DO UPDATE SET
+                report_data = EXCLUDED.report_data,
+                generated_at = NOW()
         """, (city_name, 'full', json.dumps(response_data)))
-        db.commit()
     except Exception as e:
         print(f"Full report caching error: {e}")
 
@@ -914,5 +941,10 @@ def server_error(e):
 # =============================================================================
 
 if __name__ == '__main__':
-    init_database()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Production start-up doesn't usually run init_database directly in app.py
+    # but for this deployment, we ensure the DB is ready.
+    if os.getenv('RUN_INIT', 'true').lower() == 'true':
+        init_database()
+        
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
