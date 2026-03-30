@@ -10,8 +10,9 @@ import json
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from functools import wraps
+from flask.json.provider import DefaultJSONProvider
 
 import random
 import requests
@@ -55,44 +56,81 @@ OPENAQ_API_KEY = os.getenv('OPENAQ_API_KEY')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 
 # =============================================================================
+# Custom JSON Provider for Date/Datetime Serialization
+# =============================================================================
+
+class UpdatedJSONProvider(DefaultJSONProvider):
+    """Encodes date/datetime objects to ISO strings for AJAX responsiveness."""
+    def default(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        return super().default(obj)
+
+app.json = UpdatedJSONProvider(app)
+
+
+# =============================================================================
 # Database Utilities
 # =============================================================================
 
 def get_db():
-    """Get database connection from the pool for current request context."""
+    """
+    Get database connection from the pool. 
+    Refreshes closed or broken connections for production stability.
+    """
     if 'db' not in g:
         if db_pool:
-            g.db = db_pool.getconn()
+            try:
+                conn = db_pool.getconn()
+                # Check if connection is still alive (essential for Railway/Cloud)
+                if conn.closed != 0:
+                    print("⚠️  Found closed connection in pool. Reconnecting...")
+                    # Discard the dead connection and request a new one
+                    db_pool.putconn(conn, close=True)
+                    conn = db_pool.getconn()
+                g.db = conn
+            except Exception as e:
+                print(f"❌ Critical Connection Error: {e}")
+                raise ConnectionError(f"Database connection failed: {e}")
         else:
-            # Fallback if pool is not initialized (e.g. local dev without URL)
-            raise ConnectionError("Database connection pool not initialized (check DATABASE_URL)")
+            raise ConnectionError("PostgreSQL connection pool not initialized (check DATABASE_URL)")
     return g.db
 
 
 def query_db(query: str, args: tuple = (), one: bool = False):
     """
     Production-level reusable PostgreSQL database query helper.
+    Handles automatic recovery and safe rollback.
     """
-    db = get_db()
-    cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    
     try:
-        cursor.execute(query, args)
-        if query.strip().upper().startswith("SELECT"):
-            if one:
-                result = cursor.fetchone()
+        db = get_db()
+        cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        try:
+            cursor.execute(query, args)
+            if query.strip().upper().startswith("SELECT"):
+                result = cursor.fetchone() if one else cursor.fetchall()
             else:
-                result = cursor.fetchall()
-        else:
-            db.commit()
-            result = cursor.rowcount
-        return result
+                db.commit()
+                result = cursor.rowcount
+            return result
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # Recovery: Connection might have been lost (SSL EOF, etc.)
+            print(f"⚠️  Connection Lost in query_db: {e}. Attempting recovery...")
+            g.pop('db', None) # Force get_db to fetch a fresh connection
+            return query_db(query, args, one) # Retry once
+        except Exception as e:
+            # Rollback only if the connection is still alive
+            if db and db.closed == 0:
+                db.rollback()
+            print(f"❌ Database error in query_db: {e}\nQuery: {query}")
+            return None
+        finally:
+            if 'cursor' in locals() and cursor:
+                cursor.close()
     except Exception as e:
-        db.rollback()
-        print(f"Database query error: {e}")
+        print(f"❌ Critical query_db error: {e}")
         return None
-    finally:
-        cursor.close()
 
 
 @app.teardown_appcontext
@@ -100,7 +138,15 @@ def close_db(exception):
     """Return database connection to the pool at end of request."""
     db = g.pop('db', None)
     if db is not None and db_pool is not None:
-        db_pool.putconn(db)
+        try:
+            # Only put back if connection is still healthy
+            if db.closed == 0:
+                db_pool.putconn(db)
+            else:
+                print("🗑️ Discarding closed connection from request context.")
+                db_pool.putconn(db, close=True)
+        except Exception as e:
+            print(f"Error returning connection to pool: {e}")
 
 
 def init_database():
@@ -478,9 +524,9 @@ def city_details(city_name):
     db = get_db()
 
     # Get city info
-    city_info = db.execute(
-        "SELECT * FROM city_info WHERE city_name = ?", (city_name,)
-    ).fetchone()
+    city_info = query_db(
+        "SELECT * FROM city_info WHERE city_name = %s", (city_name,), one=True
+    )
 
     if not city_info:
         return render_template('404.html', message=f"City '{city_name}' not found"), 404
@@ -534,9 +580,9 @@ def recommendations_page(city_name):
     db = get_db()
 
     # Get city info
-    city_info = db.execute(
-        "SELECT * FROM city_info WHERE city_name = ?", (city_name,)
-    ).fetchone()
+    city_info = query_db(
+        "SELECT * FROM city_info WHERE city_name = %s", (city_name,), one=True
+    )
 
     if not city_info:
         return render_template('404.html', message=f"City '{city_name}' not found"), 404
@@ -554,8 +600,7 @@ def recommendations_page(city_name):
 @app.route('/recommendations')
 def recommendations_index():
     """Root recommendations page that lists available cities."""
-    db = get_db()
-    cities = db.execute("SELECT * FROM city_info ORDER BY city_name").fetchall()
+    cities = query_db("SELECT * FROM city_info ORDER BY city_name")
     return render_template('recommendations.html', city_list=cities)
 
 
@@ -568,11 +613,10 @@ def report_redirect(city_name):
 @app.route('/reports/<city_name>')
 def report_analytical(city_name):
     """Report summary page for a city."""
-    db = get_db()
-
-    city_info = db.execute(
-        "SELECT * FROM city_info WHERE city_name = ?", (city_name,)
-    ).fetchone()
+    # Get city info
+    city_info = query_db(
+        "SELECT * FROM city_info WHERE city_name = %s", (city_name,), one=True
+    )
 
     if not city_info:
         return render_template('404.html', message=f"City '{city_name}' not found"), 404
@@ -590,8 +634,7 @@ def report_analytical(city_name):
 @app.route('/reports')
 def reports_index():
     """Root reports page that lists available cities."""
-    db = get_db()
-    cities = db.execute("SELECT * FROM city_info ORDER BY city_name").fetchall()
+    cities = query_db("SELECT * FROM city_info ORDER BY city_name")
     return render_template('reports.html', city_list=cities)
 
 
@@ -663,7 +706,8 @@ def api_aqi(city_name):
         return jsonify({'error': f'No data found for {city_name}'}), 404
 
     records_payload = [{
-        'date': row['date'], 'aqi': row['aqi'], 'pm25': row['pm25'], 
+        'date': row['date'].isoformat() if hasattr(row['date'], 'isoformat') else str(row['date']), 
+        'aqi': row['aqi'], 'pm25': row['pm25'], 
         'pm10': row['pm10'], 'no2': row['no2'], 'so2': row['so2'], 
         'co': row['co'], 'o3': row['o3']
     } for row in records_rows]
@@ -706,7 +750,8 @@ def api_aqi(city_name):
     response_data = {
         'city': city_name,
         'records': [{
-            'date': row['date'], 'aqi': row['aqi'], 'pm25': row['pm25'], 
+            'date': row['date'].isoformat() if hasattr(row['date'], 'isoformat') else str(row['date']), 
+            'aqi': row['aqi'], 'pm25': row['pm25'], 
             'pm10': row['pm10'], 'category': row['category'], 'pollutant': row['pollutant']
         } for row in records_rows],
         'forecast': forecast,
@@ -760,8 +805,8 @@ def api_compare():
     payload = {
         'city1': city1,
         'city2': city2,
-        'records1': [{'date': r['date'], 'aqi': r['aqi']} for r in records1],
-        'records2': [{'date': r['date'], 'aqi': r['aqi']} for r in records2]
+        'records1': [{'date': r['date'].isoformat() if hasattr(r['date'], 'isoformat') else str(r['date']), 'aqi': r['aqi']} for r in records1],
+        'records2': [{'date': r['date'].isoformat() if hasattr(r['date'], 'isoformat') else str(r['date']), 'aqi': r['aqi']} for r in records2]
     }
 
     # Call Haskell microservice
@@ -815,7 +860,7 @@ def api_alerts():
         if city not in records_by_city:
             records_by_city[city] = []
         records_by_city[city].append({
-            'date': alert['date'],
+            'date': alert['date'].isoformat() if hasattr(alert['date'], 'isoformat') else str(alert['date']),
             'aqi': alert['aqi']
         })
 
@@ -913,8 +958,8 @@ def api_report(city_name):
         'records': records_payload,
         'analysis': analysis,
         'report_period': {
-            'start': records[-1]['date'] if records else 'N/A',
-            'end': records[0]['date'] if records else 'N/A',
+            'start': records[-1]['date'].isoformat() if hasattr(records[-1]['date'], 'isoformat') else str(records[-1]['date']),
+            'end': records[0]['date'].isoformat() if hasattr(records[0]['date'], 'isoformat') else str(records[0]['date']),
             'total_records': len(records)
         }
     }
