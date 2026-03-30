@@ -44,12 +44,7 @@ if DATABASE_URL:
         db_pool = pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
         print("PostgreSQL connection pool initialized.")
         
-        # PRODUCTION FIX: Initialize database if required when module is loaded
-        # This ensures Gunicorn workers have a ready schema.
-        if os.getenv('RUN_INIT', 'true').lower() == 'true':
-            from app import init_database
-            init_database()
-            print("🚀 Database schema verified on startup.")
+
     except Exception as e:
         print(f"Error creating PostgreSQL connection pool or initializing DB: {e}")
 HASKELL_SERVICE_URL = os.getenv('HASKELL_SERVICE_URL', 'http://localhost:8080')
@@ -173,6 +168,12 @@ def init_database():
         conn.close()
     except Exception as e:
         print(f"Error initializing database: {e}")
+
+# PRODUCTION FIX: Initialize database if required when module is loaded
+# This ensures Gunicorn workers have a ready schema.
+if os.getenv('RUN_INIT', 'true').lower() == 'true':
+    init_database()
+    print("🚀 Database schema verified on startup.")
 
 
 def sync_historical_data(city_name):
@@ -443,7 +444,7 @@ def home():
             'category': city['category'],
             'lat': city['latitude'],
             'lng': city['longitude']
-        } for city in all_cities
+        } for city in (all_cities or [])
     ]
 
     return render_template('index.html',
@@ -468,7 +469,7 @@ def dashboard():
         ORDER BY r.aqi DESC
     """)
 
-    return render_template('dashboard.html', cities=cities)
+    return render_template('dashboard.html', cities=(cities or []))
 
 
 @app.route('/city/<city_name>')
@@ -621,7 +622,7 @@ def api_cities():
         'latitude': row['latitude'],
         'longitude': row['longitude'],
         'population': row['population']
-    } for row in cities])
+    } for row in (cities or [])])
 
 
 @app.route('/api/aqi/<city_name>')
