@@ -124,13 +124,13 @@ def query_db(query: str, args: tuple = (), one: bool = False):
             if db and db.closed == 0:
                 db.rollback()
             print(f"❌ Database error in query_db: {e}\nQuery: {query}")
-            return None
+            return [] if not one else None
         finally:
             if 'cursor' in locals() and cursor:
                 cursor.close()
     except Exception as e:
         print(f"❌ Critical query_db error: {e}")
-        return None
+        return [] if not one else None
 
 
 @app.teardown_appcontext
@@ -494,10 +494,10 @@ def home():
     ]
 
     return render_template('index.html',
-                           overall=overall,
-                           alerts=alerts,
-                           top_cities=top_cities,
-                           map_data=map_data)
+                           overall=(overall or {}),
+                           alerts=(alerts or []),
+                           top_cities=(top_cities or []),
+                           map_data=(map_data or []))
 
 
 @app.route('/dashboard')
@@ -539,7 +539,7 @@ def city_details(city_name):
         LIMIT 30
     """, (city_name,))
 
-    return render_template('city_details.html', city=city_info, records=records)
+    return render_template('city_details.html', city=(city_info or {}), records=(records or []))
 
 
 @app.route('/compare')
@@ -555,7 +555,7 @@ def compare_cities():
     city1 = request.args.get('city1', 'Delhi')
     city2 = request.args.get('city2', 'Mumbai')
 
-    return render_template('compare.html', cities=cities, city1=city1, city2=city2)
+    return render_template('compare.html', cities=(cities or []), city1=city1, city2=city2)
 
 
 @app.route('/alerts')
@@ -571,7 +571,7 @@ def alerts_page():
         ORDER BY aqi DESC
     """)
 
-    return render_template('alerts.html', alerts=active_alerts)
+    return render_template('alerts.html', alerts=(active_alerts or []))
 
 
 @app.route('/recommendations/<city_name>')
@@ -594,14 +594,14 @@ def recommendations_page(city_name):
         ORDER BY date DESC
     """, (city_name,))
 
-    return render_template('recommendations.html', city=city_info, records=records)
+    return render_template('recommendations.html', city=(city_info or {}), records=(records or []))
 
 
 @app.route('/recommendations')
 def recommendations_index():
     """Root recommendations page that lists available cities."""
     cities = query_db("SELECT * FROM city_info ORDER BY city_name")
-    return render_template('recommendations.html', city_list=cities)
+    return render_template('recommendations.html', city_list=(cities or []))
 
 
 @app.route('/report/<city_name>')
@@ -628,14 +628,14 @@ def report_analytical(city_name):
         LIMIT 30
     """, (city_name,))
 
-    return render_template('reports.html', city=city_info, records=records)
+    return render_template('reports.html', city=(city_info or {}), records=(records or []))
 
 
 @app.route('/reports')
 def reports_index():
     """Root reports page that lists available cities."""
     cities = query_db("SELECT * FROM city_info ORDER BY city_name")
-    return render_template('reports.html', city_list=cities)
+    return render_template('reports.html', city_list=(cities or []))
 
 
 # =============================================================================
