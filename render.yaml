@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: breathx-platform
+    env: docker
+    plan: free
+    region: ohio
+    healthCheckPath: /api/cities
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: breathx-db
+          property: connectionString
+      - key: RUN_INIT
+        value: "true"
+      # User must add these manually in Render Dashboard for security
+      - key: WAQI_API_KEY
+        sync: false
+      - key: OPENAQ_API_KEY
+        sync: false
+
+databases:
+  - name: breathx-db
+    plan: free
+    region: ohio

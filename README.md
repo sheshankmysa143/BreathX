@@ -40,7 +40,22 @@ The application is optimized for **Railway** using a multi-stage Docker build th
     - `RUN_INIT`: `true` (Initializes schema on first run).
 3.  **Deploy**: Railway will auto-detect the `Dockerfile` and start the stack.
 
-### 2. Local Development (Docker)
+### 2. Production (Highly Recommended - Render Blueprint)
+
+The project includes a `render.yaml` file for automated "one-click" infrastructure deployment.
+
+**Steps to Deploy:**
+1.  **Fork the Repository**: Push this code to your own GitHub/GitLab account.
+2.  **New Blueprint**: Go to Render Dashboard -> **New** -> **Blueprint**.
+3.  **Connect Repo**: Select your forked repository.
+4.  **Configure**: Render will automatically detect the Blueprint.
+    - Name your group (e.g., `breathx-production`).
+    - Add `WAQI_API_KEY` and `OPENAQ_API_KEY` in the environment variables section.
+5.  **Launch**: Click **Apply**. Render will create:
+    - A PostgreSQL Database (`breathx-db`).
+    - A Web Service (`breathx-platform`) running from the `Dockerfile`.
+
+### 3. Local Development (Docker)
 
 ```bash
 docker build -t breathx .

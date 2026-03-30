@@ -33,14 +33,25 @@ executor = ThreadPoolExecutor(max_workers=5)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_URL = os.getenv('DATABASE_URL')
+# Render/Heroku compatibility: Ensure postgresql:// is used
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 # Use a connection pool for production efficiency
 db_pool = None
 if DATABASE_URL:
     try:
         db_pool = pool.SimpleConnectionPool(1, 20, dsn=DATABASE_URL)
         print("PostgreSQL connection pool initialized.")
+        
+        # PRODUCTION FIX: Initialize database if required when module is loaded
+        # This ensures Gunicorn workers have a ready schema.
+        if os.getenv('RUN_INIT', 'true').lower() == 'true':
+            from app import init_database
+            init_database()
+            print("🚀 Database schema verified on startup.")
     except Exception as e:
-        print(f"Error creating PostgreSQL connection pool: {e}")
+        print(f"Error creating PostgreSQL connection pool or initializing DB: {e}")
 HASKELL_SERVICE_URL = os.getenv('HASKELL_SERVICE_URL', 'http://localhost:8080')
 
 # External API Keys (Loaded from .env)
