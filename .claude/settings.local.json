@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cabal build:*)",
+      "Bash(python -c \"import flask, requests; print\\(''Dependencies OK''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(timeout 5 python app.py)",
+      "Bash(find C:/Users/shesh/OneDrive/Documents/Capstone/BreathX -type f \\\\\\(-name *.html -o -name *.py -o -name *.hs -o -name *.cabal -o -name *.sql -o -name *.csv -o -name *.css -o -name *.js -o -name *.md -o -name *.txt \\\\\\))"
+    ]
+  }
+}

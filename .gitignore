@@ -1,0 +1,9 @@
+.env
+haskell-service/dist-newstyle/
+dist/
+node_modules/
+__pycache__/
+*.log
+*.sqlite
+*.db
+database/*.db
